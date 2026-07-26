@@ -3,6 +3,7 @@
 from arq.connections import RedisSettings
 
 from app.core.config import settings
+from app.worker.tasks import process_call
 
 
 async def ping(ctx: dict) -> str:
@@ -19,4 +20,6 @@ class WorkerSettings:
     """
 
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
-    functions = [ping]
+    functions = [process_call]
+    max_tries = 1        # retries become meaningful with M2 error classification
+    job_timeout = 600    # generous ceiling; a 30-min call is minutes of work in M2

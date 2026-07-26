@@ -55,5 +55,3 @@ def assert_transition(from_status: CallStatus, to_status: CallStatus) -> None:
         raise InvalidTransition(from_status, to_status)
 
 
-
-

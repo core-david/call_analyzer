@@ -68,8 +68,12 @@ services:
 
   redis:
     image: redis:7-alpine
+    # AOF persistence so queued jobs survive `docker compose down/up`.
+    command: redis-server --appendonly yes
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -114,6 +118,7 @@ services:
 volumes:
   postgres-data:
   minio-data:
+  redis-data:
 
 networks:
   call-analyzer:
