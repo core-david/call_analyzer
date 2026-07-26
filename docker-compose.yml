@@ -1,0 +1,119 @@
+name: call-analyzer
+
+services:
+  api:
+    build: ./backend
+    image: call-analyzer-backend:local
+    command: uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    environment:
+      # Override the localhost defaults with in-network service hostnames.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/call_analyzer
+      REDIS_URL: redis://redis:6379
+      STORAGE_ENDPOINT_URL: http://minio:9000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      # Anonymous volume keeps the container's Linux .venv from being shadowed
+      # by the host bind mount above.
+      - /app/.venv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - call-analyzer
+
+  worker:
+    build: ./backend
+    image: call-analyzer-backend:local
+    command: uv run arq app.worker.settings.WorkerSettings
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/call_analyzer
+      REDIS_URL: redis://redis:6379
+      STORAGE_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ./backend:/app
+      - /app/.venv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - call-analyzer
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: call_analyzer
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d call_analyzer"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - call-analyzer
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - call-analyzer
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - call-analyzer
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/call-analyzer-audio
+      "
+    restart: "no"
+    networks:
+      - call-analyzer
+
+volumes:
+  postgres-data:
+  minio-data:
+
+networks:
+  call-analyzer:

@@ -258,6 +258,64 @@ Six services in `docker-compose.yml`:
 | **minio** | `minio/minio` | S3-compatible object storage, port 9000 (API) + 9001 (console) |
 | **minio-init** | `minio/mc` | One-shot: creates the bucket, then exits |
 
+1. api — the FastAPI web server
+
+- Built from backend/Dockerfile (your own image with the app code).
+- Runs uvicorn serving app.main:app on port 8000 — this is what handles HTTP requests: the /health endpoint now, and later the upload/results endpoints.
+- Uses --reload in dev, and mounts ./backend:/app as a volume so editing code on your machine instantly restarts the server (no rebuild needed).
+- This is the only service the browser/frontend talks to.
+
+2. worker — the background job processor
+
+- Same image as api, but the command is overridden to run arq instead of uvicorn.
+- arq is a Redis-backed async task queue. When a call gets uploaded, the API doesn't transcribe it inline (that's slow — Deepgram + Gemini take seconds to minutes). Instead it drops a job on Redis, returns immediately, and the worker picks it up and does the heavy lifting.
+- Right now it's a stub — it connects to Redis but has no tasks (functions = []). Real tasks come in M1.
+- No exposed port — nothing connects to it; it only pulls jobs from Redis.
+
+3. postgres — the database
+
+- Image: postgres:16-alpine (alpine = tiny Linux base).
+- Port 5432. Stores your application data (call records, transcripts, analysis results — schema comes later).
+- Has a named volume so data survives docker compose down and container restarts.
+- Health check via pg_isready so dependent services wait until it's actually accepting connections.
+
+4. redis — the job queue broker
+
+- Image: redis:7-alpine.
+- Port 6379. In-memory data store; here it's the message bus between api (enqueues jobs) and worker (consumes jobs).
+- Health check via redis-cli ping.
+
+5. minio — local S3-compatible object storage
+
+- Image: minio/minio.
+- Stores the actual audio files. In production you'll use Cloudflare R2; MinIO is the local stand-in that speaks the same S3 API, so your storage code is identical in both environments (just swap the endpoint URL).
+- Two ports: 9000 (S3 API the app uses) and 9001 (a web console you can open in a browser to browse buckets — login minioadmin/minioadmin).
+- Health check hits /minio/health/live.
+
+6. minio-init — one-shot bucket creator
+
+- Image: minio/mc (MinIO's CLI client).
+- Not a long-running service — it starts, waits for minio to be healthy, creates the call-analyzer-audio bucket, then exits. restart: "no" keeps it from looping.
+- Without it, you'd have to manually create the bucket every fresh start. This automates it.
+
+---
+How they fit together:
+
+browser/frontend
+      │  HTTP :8000
+      ▼
+   ┌─────┐  enqueue job   ┌───────┐   pull job   ┌────────┐
+   │ api │ ─────────────► │ redis │ ◄─────────── │ worker │
+   └──┬──┘                └───────┘              └───┬────┘
+      │                                             │
+      │ read/write records                          │ store/fetch audio
+      ▼                                             ▼
+ ┌──────────┐                                  ┌─────────┐
+ │ postgres │                                  │  minio  │◄── minio-init (creates bucket, exits)
+ └──────────┘                                  └─────────┘
+
+The depends_on + health checks enforce startup order: postgres/redis/minio must be healthy, and minio-init must finish, before api and worker start — so nothing races against a database or bucket that isn't ready yet.
+
 The `backend/Dockerfile` installs `uv`, copies the project, syncs dependencies, and runs uvicorn by default. For the worker, docker-compose overrides the command to run arq instead.
 
 `env_file: .env` in docker-compose means all services read the same `.env` — one source of truth. The local-dev defaults in `config.py` are overridden by docker-compose environment variables where hostnames differ (e.g., `postgres` instead of `localhost`).
@@ -311,6 +369,53 @@ The worker needs a minimal entry point — `backend/app/worker/settings.py` with
 - `backend/Dockerfile`
 - `backend/app/worker/settings.py`
 - `docker-compose.yml`
+
+### Implementation notes (done 2026-07-24)
+
+Implemented and verified against Docker 29.3.0. Deviations from the plan above,
+each necessary:
+
+1. **arq requires ≥1 registered function.** The planned stub `functions = []`
+   crashes on boot in arq 0.28 (`RuntimeError: at least one function or cron_job
+   must be registered`). Registered a no-op `ping` task so the worker is a valid
+   stub until M1. Also, `redis_settings` must be a `RedisSettings` object, not a
+   URL string — used `RedisSettings.from_dsn(settings.redis_url)`.
+
+   ```python
+   from arq.connections import RedisSettings
+   from app.core.config import settings
+
+   async def ping(ctx: dict) -> str:
+       return "pong"
+
+   class WorkerSettings:
+       redis_settings = RedisSettings.from_dsn(settings.redis_url)
+       functions = [ping]
+   ```
+
+2. **MinIO healthcheck uses `curl`, not `mc ready local`.** Verified the
+   `minio/minio` image ships both `curl` and `mc`, but `mc ready local` needs an
+   alias that isn't configured inside the server container. Used
+   `curl -f http://localhost:9000/minio/health/live` (self-contained, matches
+   the plan's intent).
+
+3. **Anonymous volume for `/app/.venv`.** The `./backend:/app` bind mount would
+   otherwise shadow the container's Linux venv with the host's macOS venv,
+   breaking `uv run`. Added `- /app/.venv` to the api/worker volume lists.
+
+4. **`backend/.dockerignore` added** (not in the original plan) to keep `.venv`,
+   `tests/fixtures/audio/`, and `.env` out of the build context.
+
+5. **Dockerfile installs uv by copying from the official image**
+   (`COPY --from=ghcr.io/astral-sh/uv:latest`) rather than `pip install uv`, and
+   uses `uv sync --frozen --no-dev` for a lean production image.
+
+**Verification results:** all six services start in dependency order;
+`curl localhost:8000/health` → `{"status":"ok"}`; postgres/redis/minio reach
+healthy; minio-init exits 0 after creating the `call-analyzer-audio` bucket;
+worker logs `Starting worker for 1 functions: ping` and connects to Redis.
+
+**Extra file created:** `backend/.dockerignore`.
 
 ---
 
