@@ -35,6 +35,9 @@ services:
       # Storage config comes entirely from .env (R2) — single source of truth.
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/call_analyzer
       REDIS_URL: redis://redis:6379
+      # Dev-only fault-injection levers (empty/inert unless set on the host).
+      FAULT_INJECT_TRANSCRIPTION: ${FAULT_INJECT_TRANSCRIPTION:-}
+      FAULT_INJECT_ANALYSIS: ${FAULT_INJECT_ANALYSIS:-}
     volumes:
       - ./backend:/app
       - /app/.venv
