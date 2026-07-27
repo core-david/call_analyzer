@@ -34,3 +34,5 @@ docker-compose.override.yml
 # Local transcript dumps (contain call PII)
 transcripts/
 backend/transcripts/
+.env.bak
+.env.*.bak

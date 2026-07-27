@@ -1,6 +1,12 @@
 """The pipeline task: walks a call through the state machine with
 DB-checkpointed stages. Stage work is skipped when its output already
-exists (idempotent retries — the M2 contract, honored from day one)."""
+exists — idempotency that keeps a crash-redelivered job from re-paying for
+transcription.
+
+Failure handling (reduced M2 scope): provider failures are classified into a
+machine-readable error_code and the call is marked `failed`. Automatic
+retry-with-backoff and a user-triggered retry endpoint are deferred — the
+error taxonomy (retryable vs permanent) is in place so both drop in later."""
 
 import logging
 import uuid
@@ -11,6 +17,7 @@ from app.core.db import SessionFactory
 from app.models.call import Call
 from app.models.states import CallStatus, assert_transition
 from app.services.analysis import analyze
+from app.services.errors import ProviderError
 from app.services.storage import storage
 from app.services.transcription import transcribe
 
@@ -21,6 +28,15 @@ async def _advance(session: AsyncSession, call: Call, to_status: CallStatus) -> 
     """Move the call to `to_status` — legality checked, then checkpointed."""
     assert_transition(CallStatus(call.status), to_status)
     call.status = to_status
+    await session.commit()
+
+
+async def _fail(session: AsyncSession, call: Call, error_code: str) -> None:
+    """Land the row in `failed` with a diagnosable code — never silently."""
+    await session.rollback()
+    await session.refresh(call)
+    call.status = CallStatus.FAILED
+    call.error_code = error_code
     await session.commit()
 
 
@@ -48,11 +64,12 @@ async def process_call(ctx: dict, call_id: str) -> None:
             await _advance(session, call, CallStatus.COMPLETED)
             logger.info("call %s completed", call_id)
 
+        except ProviderError as e:
+            # Classified external-service failure: persist its error_code.
+            logger.warning("call %s failed: %s", call_id, e.error_code)
+            await _fail(session, call, e.error_code)
+            raise
         except Exception:
-            # Mark failure visibly, then let arq log the traceback.
-            await session.rollback()
-            await session.refresh(call)
-            call.status = CallStatus.FAILED
-            call.error_code = "internal_error"
-            await session.commit()
+            # Unclassified bug — mark failed, then let arq log the traceback.
+            await _fail(session, call, "internal_error")
             raise

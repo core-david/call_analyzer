@@ -5,13 +5,18 @@
 > provider failures — same `transcribe()` signature, so the worker pipeline
 > from M1 barely changes.
 >
-> Scope notes (agreed):
-> - Retry endpoint (`POST /calls/{id}/retry`) is in scope — M1 deferred it here.
-> - Transient retries are owned by **arq** (`Retry` + `max_tries`); the row never
->   tracks attempt counts, only `error_code`. User-triggered retry is a *fresh
->   enqueue* on a `failed` row, not a resurrection of the exhausted job.
-> - Concurrency semaphore is a **per-process `asyncio.Semaphore`** created in
->   arq `on_startup` — distributed variants are a README production note.
+> Scope notes (agreed — reduced M2):
+> - **Failures are classified and surfaced, not retried.** The worker maps a
+>   provider failure to a machine-readable `error_code` and marks the call
+>   `failed`. `max_tries=1`, no backoff.
+> - **Deferred to future improvements** (the error taxonomy makes both drop-in):
+>   - automatic retry-with-backoff (`arq.Retry`) — 2.3 stays minimal;
+>   - the user-triggered retry endpoint (`POST /calls/{id}/retry`) — was 2.5;
+>   - the dedicated per-provider concurrency semaphore — was 2.4. At single-worker
+>     scale arq's `max_jobs` (10) already caps concurrency under Deepgram's
+>     50-request limit; the semaphore is the multi-worker scaling knob (plan §7).
+> - Recovery from a transient failure is re-upload until the above land — a
+>   documented limitation, honest because failures are visible with a code.
 > - No pytest in M2 — each task ends with a manual verify step. The suite is M5.
 
 ---
@@ -36,45 +41,38 @@
   2. Presigned URL TTL vs. queue latency — is the 3600s default safe when a job may wait in the queue before running, and should the URL be generated per-attempt inside the task rather than once?
   3. Shape extensions — Deepgram returns duration and confidence; does `duration` get promoted into the row's column now (the open question from 1.2), and does anything else (confidence, detected language per utterance) enter the transcript JSON?
 
-## Task 2.3 — Retry & backoff in the worker
+## Task 2.3 — Error handling in the worker (simplified)
 
-- **What:** Wire 2.1 into `process_call`: retryable errors raise `arq.Retry` with exponential defer (capped by `max_tries`); permanent errors and exhausted retries mark `failed` with the specific `error_code`.
+- **What:** Wire 2.1 into `process_call`: catch `ProviderError`, mark the call `failed` with its specific `error_code`, re-raise for logs; unclassified exceptions fall back to `internal_error`. `max_tries=1`, no backoff. Keep the checkpoint-skip (`if transcript is None`) for crash-redelivery safety.
 - **Files:** `backend/app/worker/tasks.py`, edits to `backend/app/worker/settings.py`
 - **Depends on:** 2.1, 2.2
-- **Key decisions:**
-  1. Backoff schedule and caps — defer values (e.g. 5s → 25s → 125s), `max_tries=3`, and a `job_timeout` sized for 30-minute calls held open against Deepgram.
-  2. Re-entry through the state machine — on an arq re-run the row is already `transcribing`; does `assert_transition` permit self-transitions, or does the task skip `_advance` when the status already matches?
-  3. Final-failure sequencing — when tries are exhausted arq raises through; where exactly does the task persist `failed` + `error_code` before re-raising, and what does the row's status say *during* a deferred wait (stays `transcribing` — acceptable?)?
+- **Key decisions (resolved):**
+  1. No retry — a transient failure marks `failed`; recovery is re-upload until the deferred retry features land.
+  2. `job_timeout` must exceed the 600s Deepgram request timeout (set to 900) so a slow transcription can't hit the job ceiling first.
+  3. `_fail` helper does rollback → refresh → mark `failed` → commit, so a mid-stage failure never leaves a partial commit.
 
-## Task 2.4 — Per-provider concurrency semaphore
+## Task 2.4 — Per-provider concurrency semaphore *(deferred → future improvements)*
 
-- **What:** Cap concurrent Deepgram calls with an `asyncio.Semaphore` created in arq `on_startup`, independent of `max_jobs`.
-- **Files:** edits to `backend/app/worker/settings.py`, `backend/app/worker/tasks.py`
-- **Depends on:** 2.2 (wraps the real call; pointless around a stub)
-- **Key decisions:**
-  1. Limit value and its config knob (`DEEPGRAM_MAX_CONCURRENCY` env var, default ~5?) — sized against Deepgram's concurrent-request quota, not guessing.
-  2. Who holds the semaphore — the worker task wraps `await transcribe(...)` (services stay free of global state) vs. passing it into the service; where does it live in `ctx`?
-  3. Hold-time interaction — a 30-minute file holds the permit for minutes; how do `max_jobs` and the semaphore limit relate so jobs aren't parked holding neither permit nor progress, and does a second (placeholder) semaphore for the M3 LLM provider get created now?
+Not built in reduced M2. At single-worker scale arq's `max_jobs` (default 10)
+already caps concurrent Deepgram calls under the 50-request quota. The dedicated
+`asyncio.Semaphore` is the multi-worker scaling knob — documented in
+ARCHITECTURE.md / plan §7, implemented when a second worker is added.
 
-## Task 2.5 — Retry endpoint
+## Task 2.5 — Retry endpoint *(deferred → future improvements)*
 
-- **What:** `POST /calls/{id}/retry` — allowed only from `failed`; clears `error_code`, enqueues a fresh job, returns `202`; the checkpoint guarantees transcription is skipped if the transcript already exists.
-- **Files:** edits to `backend/app/api/calls.py`, `backend/app/models/schemas.py`
-- **Depends on:** 2.1, 2.3 (real failures and re-entry semantics must exist first)
-- **Key decisions:**
-  1. Preconditions — non-`failed` rows get `409`; is there a race with a still-in-flight job for the same call, and does the endpoint need to care?
-  2. Who transitions the row — the endpoint moves `failed → transcribing` immediately (UI feedback, but lies if the queue is backed up) vs. the worker transitions on pickup (row says `failed` while queued)?
-  3. Double-submit guard — two rapid retries enqueue two jobs; dedupe via deterministic arq job id (e.g. `retry:{call_id}`) or accept it (checkpoints make double-runs harmless but wasteful)?
+Not built in reduced M2. `POST /calls/{id}/retry` (`failed → transcribing`,
+fresh enqueue, checkpoint skips transcription) is a clean future addition —
+the state machine already models the transition and the error taxonomy already
+distinguishes what is worth retrying.
 
 ## Task 2.6 — End-to-end verification
 
-- **What:** The milestone exit check as a task: long-recording run, simulated provider failures landing in the correct path, and proof that retry-after-transcript never re-calls Deepgram.
-- **Files:** none new (manual verify; optionally a note in `.claude/` recording results for the M7 narrative)
-- **Depends on:** 2.2, 2.3, 2.4, 2.5
+- **What:** The milestone exit check as a task: real long-recording run to `completed` with a diarized transcript persisted, and permanent provider failures landing in the correct path with the right `error_code`.
+- **Files:** none new (manual verify; results noted in `.claude/milestone_2_results.md` for the M7 narrative)
+- **Depends on:** 2.2, 2.3
 - **Key decisions:**
-  1. Failure simulation method — invalid API key / garbage audio file vs. a temporary fault-injection env var in the transcription service; which covers both the retryable and permanent paths honestly?
-  2. Checkpoint proof — how to *prove* Deepgram wasn't called on the second run: a "checkpoint hit, skipping transcription" log line, the Deepgram usage dashboard, or both?
-  3. What gets recorded — do the verification results (timings for the 20–30 min file, observed retry behavior) get written down now as raw material for the README's testing/architecture sections?
+  1. Failure simulation — garbage bytes named `.wav` (real Deepgram 4xx → `audio_unreadable`) and a silent file (200 empty → `no_speech_detected`); plus the `FAULT_INJECT_TRANSCRIPTION=permanent` lever for the worker path.
+  2. What gets recorded — timings for the 20–30 min file and the observed failure codes, as raw material for the README testing/architecture sections.
 
 ---
 
@@ -83,22 +81,19 @@
 ```mermaid
 graph TD
     T21[2.1 Error taxonomy] --> T22[2.2 Deepgram integration]
-    T21 --> T23[2.3 Retry & backoff]
+    T21 --> T23[2.3 Error handling in worker]
     T22 --> T23
-    T22 --> T24[2.4 Concurrency semaphore]
-    T21 --> T25[2.5 Retry endpoint]
-    T23 --> T25
     T22 --> T26[2.6 E2E verification]
     T23 --> T26
-    T24 --> T26
-    T25 --> T26
+    T24[2.4 Concurrency semaphore — deferred]:::deferred
+    T25[2.5 Retry endpoint — deferred]:::deferred
+    classDef deferred stroke-dasharray: 5 5,opacity:0.6;
 ```
 
-Execution order: **2.1 → 2.2 → 2.3 → 2.4 → 2.5 → 2.6** (2.4 and 2.5 are
-independent of each other and can swap).
+Execution order (reduced M2): **2.1 → 2.2 → 2.3 → 2.6**. 2.4 and 2.5 are
+deferred to future improvements.
 
 *Milestone exit check:* upload the 20–30 minute recording → speaker-labeled
-transcript lands in the DB → force a retryable failure and watch backoff →
-force a permanent failure and see `failed` + correct `error_code` → hit the
-retry endpoint on a call with a persisted transcript → completed, with proof
-Deepgram was never called the second time.
+transcript lands in the DB → force a permanent failure (garbage file, or
+`FAULT_INJECT_TRANSCRIPTION=permanent`) and see `failed` + the correct
+`error_code`.
