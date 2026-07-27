@@ -58,7 +58,7 @@ async def process_call(ctx: dict, call_id: str) -> None:
             # Stage 2 — analysis (skipped if checkpoint exists).
             await _advance(session, call, CallStatus.ANALYZING)
             if call.analysis is None:
-                call.analysis = await analyze(call.transcript["text"])
+                call.analysis = await analyze(call.transcript)
                 await session.commit()  # checkpoint: analysis is durable
 
             await _advance(session, call, CallStatus.COMPLETED)
