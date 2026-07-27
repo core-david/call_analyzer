@@ -1,14 +1,18 @@
 """Call endpoints."""
 
+import base64
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from arq.connections import ArqRedis
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_arq_pool, get_session
 from app.models.call import Call
+from app.models.schemas import CallDetail, CallListItem, CallListPage
 from app.models.states import CallStatus
 from app.services.storage import storage
 
@@ -94,3 +98,51 @@ async def upload_call(
         raise HTTPException(500, detail="upload stored but queueing failed")
 
     return {"id": str(call_id), "status": str(call.status)}
+
+
+def _encode_cursor(created_at: datetime, call_id: uuid.UUID) -> str:
+    return base64.urlsafe_b64encode(f"{created_at.isoformat()}|{call_id}".encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    try:
+        raw_ts, raw_id = base64.urlsafe_b64decode(cursor.encode()).decode().split("|")
+        return datetime.fromisoformat(raw_ts), uuid.UUID(raw_id)
+    except Exception:
+        raise HTTPException(400, detail="malformed cursor")
+
+
+@router.get("", response_model=CallListPage)
+async def list_calls(
+    status: CallStatus | None = None,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> CallListPage:
+    stmt = select(Call).order_by(Call.created_at.desc(), Call.id.desc())
+    if status is not None:
+        stmt = stmt.where(Call.status == status)
+    if cursor is not None:
+        after_ts, after_id = _decode_cursor(cursor)
+        stmt = stmt.where(tuple_(Call.created_at, Call.id) < (after_ts, after_id))
+
+    rows = (await session.execute(stmt.limit(limit + 1))).scalars().all()
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(items[-1].created_at, items[-1].id) if has_more else None
+    return CallListPage(
+        items=[CallListItem.model_validate(r) for r in items],
+        next_cursor=next_cursor,
+    )
+
+
+@router.get("/{call_id}", response_model=CallDetail)
+async def get_call(
+    call_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> CallDetail:
+    call = await session.get(Call, call_id)
+    if call is None:
+        raise HTTPException(404, detail="call not found")
+    return CallDetail.model_validate(call)
