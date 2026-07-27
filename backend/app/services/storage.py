@@ -26,6 +26,7 @@ class S3Storage:
             endpoint_url=settings.storage_endpoint_url,
             aws_access_key_id=settings.storage_access_key,
             aws_secret_access_key=settings.storage_secret_key,
+            region_name=settings.storage_region,
         )
 
     async def save(self, fileobj: BinaryIO, key: str) -> None:

@@ -1,4 +1,7 @@
-"""Verify the stub services return the agreed shapes.
+"""Verify the analysis stub returns the agreed shape.
+
+Transcription is a real Deepgram integration since M2 — its shape is
+verified by scripts/check_deepgram.py, not here.
 
 Run: cd backend && uv run python scripts/check_stubs.py
 """
@@ -12,21 +15,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services.analysis import analyze
-from app.services.transcription import transcribe
 
 
 async def main() -> None:
-    t = await transcribe("http://fake-url")
-    assert {"language", "text", "utterances"} <= t.keys(), t.keys()
-    assert t["utterances"], "expected at least one utterance"
-    for u in t["utterances"]:
-        assert {"speaker", "start", "end", "text"} <= u.keys(), u
-
-    a = await analyze(t["text"])
+    a = await analyze("A short sample sales-call transcript for shape checking.")
     assert {"summary", "tags", "intent", "mood"} <= a.keys(), a.keys()
     assert {"outcome", "objections", "lead_temperature"} <= a["tags"].keys(), a["tags"]
 
-    print("shapes OK")
+    print("analysis shape OK")
 
 
 if __name__ == "__main__":
