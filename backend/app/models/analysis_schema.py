@@ -4,6 +4,10 @@ One definition serves three roles: Gemini's response_schema (structured
 output), the post-response validator, and the documented shape of the
 calls.analysis JSONB. The enums ARE the vocabularies — the single source
 of truth for what the model may emit.
+
+Field order matters: `reasoning` is defined first so the model produces it
+before the tags (structured output is generated in property order), which
+forces the classifications to be grounded rather than guessed field-by-field.
 """
 
 from enum import StrEnum
@@ -20,7 +24,7 @@ class Outcome(StrEnum):
     NO_CLEAR_OUTCOME = "no_clear_outcome"
 
 
-class Objection(StrEnum):
+class ObjectionType(StrEnum):
     PRICE = "price"
     TIMING = "timing"
     AUTHORITY = "authority"
@@ -50,19 +54,31 @@ class Mood(StrEnum):
     FRUSTRATED = "frustrated"
 
 
+class ObjectionItem(BaseModel):
+    type: ObjectionType
+    quote: str = Field(description="Short verbatim line from the transcript showing this objection")
+
+
 class Tags(BaseModel):
     outcome: Outcome
-    objections: list[Objection] = Field(default_factory=list)
+    objections: list[ObjectionItem] = Field(default_factory=list)
     lead_temperature: LeadTemperature
 
 
 class SpeakerMood(BaseModel):
-    agent: Mood
-    customer: Mood
+    label: Mood
+    note: str = Field(description="One sentence: the speaker's mood and how it evolved during the call")
+
+
+class SpeakerMoods(BaseModel):
+    agent: SpeakerMood
+    customer: SpeakerMood
 
 
 class AnalysisResult(BaseModel):
+    reasoning: str = Field(description="2-4 sentences tying transcript evidence to the tags below; produced first")
     summary: str
     tags: Tags
     intent: Intent
-    mood: SpeakerMood
+    mood: SpeakerMoods
+    next_step: str = Field(description="The single most appropriate follow-up action")
