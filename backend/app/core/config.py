@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 # Repo-root .env, resolved absolutely so config loads the same file regardless
@@ -33,6 +34,24 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://localhost:6379"
+
+    # CORS — comma-separated origins allowed to call the API (the deployed
+    # frontend). Local Vite dev server is the default.
+    cors_origins: str = "http://localhost:5173"
+
+    @field_validator("database_url")
+    @classmethod
+    def _asyncpg_scheme(cls, v: str) -> str:
+        # Render's managed Postgres hands out postgresql:// (or postgres://);
+        # our async stack needs the +asyncpg driver.
+        for prefix in ("postgresql://", "postgres://"):
+            if v.startswith(prefix):
+                return "postgresql+asyncpg://" + v[len(prefix):]
+        return v
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     model_config = {"env_file": _ENV_FILE, "extra": "ignore"}
 

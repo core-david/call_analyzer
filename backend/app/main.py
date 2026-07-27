@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import calls
 from app.core.config import settings
@@ -17,6 +18,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Call Analyzer", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(calls.router, prefix="/api")
 
 
