@@ -30,3 +30,7 @@ backend/tests/fixtures/audio/
 
 # Docker
 docker-compose.override.yml
+
+# Local transcript dumps (contain call PII)
+transcripts/
+backend/transcripts/
